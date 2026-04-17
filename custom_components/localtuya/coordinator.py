@@ -45,6 +45,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 RECONNECT_INTERVAL = timedelta(seconds=5)
+EVENT_DRIVEN_DISCONNECT_DELAY = 2
 # Subdevice: Offline events before disconnecting the device, around 5 minutes
 MIN_OFFLINE_EVENTS = 5 * 60 // HEARTBEAT_INTERVAL
 
@@ -97,6 +98,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._task_shutdown_entities: asyncio.Task | None = None
         self._unsub_refresh: CALLBACK_TYPE | None = None
         self._unsub_new_entity: CALLBACK_TYPE | None = None
+        self._unsub_event_driven_disconnect: CALLBACK_TYPE | None = None
 
         self._entities = []
 
@@ -136,16 +138,26 @@ class TuyaDevice(TuyaListener, ContextualLogger):
     @property
     def is_sleep(self):
         """Return whether the device is sleep or not."""
-        if self._device_config.event_driven:
-            setattr(self, "low_power", True)
-            return True
-
         if (device_sleep := self._device_config.sleep_time) > 0:
             setattr(self, "low_power", True)
             last_update = time.monotonic() - self._last_update_time
             return last_update < device_sleep
 
         return False
+
+    @property
+    def is_event_driven(self):
+        """Return whether the device wakes only on external events."""
+        if self._device_config.event_driven:
+            setattr(self, "low_power", True)
+            return True
+
+        return False
+
+    @property
+    def preserves_state(self):
+        """Return whether the device should keep the last known state."""
+        return self.is_event_driven or self.is_sleep
 
     @property
     def is_write_only(self):
@@ -159,6 +171,43 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         """Set the entities associated with this device."""
         self._entities.extend(entities)
 
+    @callback
+    def _cancel_event_driven_disconnect(self):
+        """Cancel the delayed disconnect for event-driven devices."""
+        if self._unsub_event_driven_disconnect:
+            self._unsub_event_driven_disconnect()
+            self._unsub_event_driven_disconnect = None
+
+    @callback
+    def _schedule_event_driven_disconnect(self):
+        """Close idle event-driven connections after a short listen window."""
+        if not self.is_event_driven:
+            return
+
+        self._cancel_event_driven_disconnect()
+        if self.is_closing or not self.connected:
+            return
+
+        @callback
+        def _disconnect_later(_now):
+            self._unsub_event_driven_disconnect = None
+            self.hass.async_create_task(self._disconnect_event_driven())
+
+        self._unsub_event_driven_disconnect = async_call_later(
+            self.hass, EVENT_DRIVEN_DISCONNECT_DELAY, _disconnect_later
+        )
+
+    async def _disconnect_event_driven(self):
+        """Drop idle event-driven sockets so reconnects can catch the next wake window."""
+        if not self.is_event_driven or self.is_closing or not self.connected:
+            return
+
+        self.debug("Closing idle event-driven connection", force=True)
+        await self.abort_connect()
+
+        if self._task_reconnect is None:
+            self._task_reconnect = asyncio.create_task(self._async_reconnect())
+
     async def async_connect(self, _now=None) -> None:
         """Connect to device if not already connected."""
         if self.is_closing or self.is_connecting:
@@ -168,7 +217,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             return self._dispatch_status()
 
         self._task_connect = asyncio.create_task(self._make_connection())
-        if not self.is_sleep:
+        if not self.is_sleep and not self.is_event_driven:
             await self._task_connect
 
     async def _connect_subdevices(self):
@@ -183,7 +232,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
     async def _make_connection(self):
         """Subscribe localtuya entity events."""
-        if self.is_sleep and not self._status:
+        if self.preserves_state and not self._status:
             self.status_updated(RESTORE_STATES)
 
         name, host = self._device_config.name, self._device_config.host
@@ -230,14 +279,14 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 await self.abort_connect()
                 if (
                     e.errno == errno.EHOSTUNREACH
-                    and not self._status
-                    and not self.is_sleep
+                    and (self.is_event_driven or (not self._status and not self.is_sleep))
                 ):
-                    self.warning(f"Connection failed: {e}")
+                    if not self.is_event_driven:
+                        self.warning(f"Connection failed: {e}")
                     break
             except Exception as ex:  # pylint: disable=broad-except
                 await self.abort_connect()
-                if not self.is_sleep:
+                if not self.is_sleep and not self.is_event_driven:
                     self.warning(f"Failed to connect to {host}: {str(ex)}")
                 if "key" in str(ex):
                     update_localkey = True
@@ -327,7 +376,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             if self.sub_devices:
                 asyncio.create_task(self._connect_subdevices())
 
-            if not self._device_config.event_driven:
+            if not self.is_event_driven:
                 self._interface.keep_alive(len(self.sub_devices) > 0)
 
         # If not connected try to handle the errors.
@@ -342,6 +391,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
     async def abort_connect(self):
         """Abort the connect process to the interface[device]"""
+        self._cancel_event_driven_disconnect()
+
         if self.is_subdevice:
             self._interface = None
             self._task_connect = None
@@ -383,6 +434,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             self._unsub_refresh()
             self._unsub_refresh = None
 
+        self._cancel_event_driven_disconnect()
+
         await self.abort_connect()
 
         if self.gateway:
@@ -412,7 +465,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             await asyncio.sleep(0.001)
             await self.set_status()
         else:
-            if self.is_sleep:
+            if self.preserves_state:
                 return self._pending_status.update({str(dp_index): state})
 
     async def set_dps(self, states):
@@ -422,7 +475,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             await asyncio.sleep(0.001)
             await self.set_status()
         else:
-            if self.is_sleep:
+            if self.preserves_state:
                 return self._pending_status.update(states)
 
     async def _async_refresh(self, _now):
@@ -491,7 +544,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 self.debug(f"Shutdown entities task has been canceled: {e}", force=True)
                 return
 
-            if self.connected or self.is_sleep:
+            if self.connected or self.preserves_state:
                 self._task_shutdown_entities = None
                 return
 
@@ -616,6 +669,9 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._status.update(status)
         self._dispatch_status()
 
+        if self.is_event_driven:
+            self._schedule_event_driven_disconnect()
+
     @callback
     def disconnected(self, exc=""):
         """Device disconnected."""
@@ -626,6 +682,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if self._unsub_refresh:
             self._unsub_refresh()
             self._unsub_refresh = None
+
+        self._cancel_event_driven_disconnect()
 
         for subdevice in self.sub_devices.values():
             subdevice.disconnected("Gateway disconnected")
